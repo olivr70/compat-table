@@ -8,6 +8,9 @@ var dataES6 = require("./data-es6");
 var dataES7 = require("./data-es7");
 var tests = {es5: dataES5.tests, es6 : dataES6.tests, es7: dataES7.tests };
 
+// ------------------- Utilities --------------------
+
+
 var indents = ["", " ", "  ", "   ", "    ", "     ", "      "];
 
 /** the error message for tests which cannot be run */
@@ -23,7 +26,14 @@ function ind(count) {
   return count < indents.length ? indents[count] : indents[indents.length - 1];
 }
 
+function clipString(len, str) {
+  if (str == undefined) return str;
+  str = str.toString();
+  return str.length < len ? str : str.substring(0, len - 3) + "...";
+}
+
 function err(msg) { return {ok:false,error:msg}; }
+
 
 /** a join function which ignores empty elements */
 function joinNotEmpty(items, sep) {
@@ -38,19 +48,54 @@ function joinNotEmpty(items, sep) {
   return str;
 }
 
+// ------------------- Test support functions --------
+// Defines the test runtime environment
+// These functions are expected to exist in some tests
+if (typeof global === 'undefined') {
+  var global = this;
+}
+function __createIterableObject(arr, methods) {
+  methods = methods || {};
+  if (typeof Symbol !== 'function' || !Symbol.iterator) {
+    return {};
+  }
+  arr.length++;
+  var iterator = {
+    next: function() {
+      return { value: arr.shift(), done: arr.length <= 0 };
+    },
+    'return': methods['return'],
+    'throw': methods['throw']
+  };
+  var iterable = {};
+  iterable[Symbol.iterator] = function(){ return iterator; }
+  return iterable;
+}
+global.__createIterableObject = __createIterableObject;
+
+
+
+// ------------------------ The builder itself ---------
+
 /** extracts the function body from its string representation, as returend by
  * toString()
  */
-function funcBody(func) {
+function extractFunctionBody(func) {
   var commentedBody = /[^]*\/\*([^]*)\*\/\}$/.exec(func);
   if (commentedBody) {
-    return commentedBody[1];
+    return commentedBody[1].trim();
   } else {
     var explicitBody = /^\s*function\s*\(([^\)]*)\)\s*\{([^]*)\}\s*$/.exec(func);
     if (explicitBody) {
-      return explicitBody[2];
+      return explicitBody[2].trim();
     }
   }
+}
+
+/** changed the test source code for our runtime environment */
+function adaptToRuntime(body) {
+  //body = body.replace(/global\.__createIterableObject/g,"__createIterableObject");
+  return body;
 }
 
 function isAsyncTest(body) {
@@ -120,7 +165,7 @@ function jsEscape(str) {
 }
 
 function runTest(func) {
-  var body = funcBody(func);
+  var body = extractFunctionBody(func);
   if (body) {
     try {
       var func = new Function(body);
@@ -189,7 +234,7 @@ function accept(options, testPath) {
 /** generates a test property and its function */
 function genTestString(options,test, testPath, ioReport, tab) {
   options = options || {};
-  var body = funcBody(test.exec.toString());
+  var body = adaptToRuntime(extractFunctionBody(test.exec.toString()));
   var isAsync = isAsyncTest(body);
   var bodyMin = options.noMinify ? body : tryMinifyBody(testPath, body, ioReport.addMinifyError.bind(ioReport));
   var res = "";
@@ -285,7 +330,9 @@ function generateTests(filename, options) {
     str += "// ES6 compatibility checks\n";
     str += "// -------------------------\n";
     str += "var unableMsg = '"+ unableMsg + "';\n";
-    str += "function f(b){try{return new Function(b)} catch(e){return function(){return e;}}}\n";
+    str += "function wrapStrict(f) { return function() { var v = f(); return v === true ? 'strict' : v; } }";
+    str += "function f(b){try{return new Function('global',b)} catch(e){" 
+      + "try { return wrapStrict(new Function('global','\"use strict\";'+b)); } catch (ee) { return function(){return ee;}}}}\n";
     str += "function a(b){return function() { return new Error(unableMsg)}}\n"
     str += "module.exports = {";
     var groups = [genTestGroup(['es5'], tests.es5, options, report, "  "),
@@ -335,7 +382,7 @@ function runRecursiveAsync(tests, depth, cb) {
       if (typeof test === "function") {
         var result;
         try {
-          result = test( );
+          result = test( global );
         } catch (e) {
           result = e;
         }
@@ -364,15 +411,17 @@ function runRecursive(tests, depth) {
     if (typeof test === "function") {
       var result;
       try {
-        result = test();
+        result = test(global);
       } catch (e) {
         result = e;
       }
       var unableToRun = (result instanceof Error) && result.message == unableMsg;
-      var color = unableToRun ? blue : (result === true ? green : red);
-      console.log(ind(depth * 2), color, name, noColor, "> ", result);
+      var strictOnly = (result === "strict");
+      var color = strictOnly ? cyan : (unableToRun ? blue : (result == true ? green : red));
+      var check = (result == true ? '\u2714' : '\u2718')
+      console.log(color, check, "\t", name, noColor, "> ", clipString(30,result));
     } else {
-      console.log(ind(depth * 2), name);
+      console.log('\u25BC\t', name);
       runRecursive(test, depth + 1);
     }
   }
@@ -438,5 +487,5 @@ loadAndRunAll("./compatES6.js");
 //writeChecksJs({include:[testGroups.es7]}, "./compatES7.js");
 //loadAndRunAll("./compatES7.js");
 
-//writeChecksJs({include:[testGroups.generators]}, "./compatRest.js");
-
+//writeChecksJs({include:[testGroups.es6_bindings],noMinify:true}, "./compatEs6Bindings.js");
+//loadAndRunAll("./compatEs6Bindings.js");
