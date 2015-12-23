@@ -1,7 +1,47 @@
 
 
+var argv = require("yargs")
+    .version(function() {
+        return require('./package').version;
+      })
+    .help("h")
+    .alias("h","help")
+    .default({ summary: false, fail: false
+        , errors:false, indent:false, verbose:false, src: false })
+    .boolean(["summary","fail","errors", "indent", "verbose", "code"])
+    .alias("s","summary")
+    .describe("summary", "if true, only summary lines for multiple tests are displayed")
+    .alias("e","errors")
+    .describe("errors", "if true, shows Errors thrown by tests")
+    .alias("l","fail")
+    .describe("errors", "if true, shows only tests which fail")
+    .alias("v","verbose")
+    .describe("verbose", "display detailed information")
+    .boolean("src")
+    .describe("src", "display source code of tests")
+    .describe("f", "target file")
+    .alias("f", "file")
+    .default("f", "./escheck.js") 
+    .boolean("minify")
+    .default("minify", false)
+    .describe("minify", "if set, will try to minify tests")
+    .alias("x", "exclude")
+    .describe("x", "test path pattern to exclude, as a RegExp, ")
+    .argv;
+    
+    
+var reportOptions = {
+  summary:true,
+  fail:true,
+  errors:true
+}
+    
 var fs         = require('fs');
+var chalk      = require('chalk');
 var UglifyJS = require("uglify-js");
+var highlight = require('console-highlight');
+
+var _ = require('lodash');
 
 var dataES5 = require("./data-es5");
 var dataES6 = require("./data-es6");
@@ -26,6 +66,10 @@ function ind(count) {
   return count < indents.length ? indents[count] : indents[indents.length - 1];
 }
 
+function indentCode(depth, src) {
+  return src.split("\n").join("\n" + ind(depth));
+}
+
 function clipString(len, str) {
   if (str == undefined) return str;
   str = str.toString();
@@ -46,6 +90,15 @@ function joinNotEmpty(items, sep) {
     }
   }
   return str;
+}
+
+// from @megawac here http://stackoverflow.com/questions/25333918/js-deep-map-function
+function deepMap(obj, iterator, context) {
+    return _.transform(obj, function(result, val, key) {
+        result[key] = _.isObject(val) /*&& !_.isDate(val)*/ ?
+                            deepMap(val, iterator, context) :
+                            iterator.call(context, val, key, obj);
+    });
 }
 
 // ------------------- Test support functions --------
@@ -76,6 +129,25 @@ global.__createIterableObject = __createIterableObject;
 
 
 // ------------------------ The builder itself ---------
+
+function capitalize(s/*:string*/) {
+  if (s== undefined) return s;
+  return s.charAt(0).toUpperCase() + s.substring(1);
+}
+function lowerize(s/*:string*/) {
+  if (s== undefined) return s;
+  return s.charAt(0).toLowerCase() + s.substring(1);
+}
+
+/** transforms any string to a valid identifier
+ */
+function makeIdentifier(str) {
+  var parts = str.split(/\W+/).filter(Boolean);
+  var initial = parts[0];
+  if (/[0-9]/.test(initial.charAt(0))) initial = "_" + initial;
+  var res = [ initial.toLowerCase() ];
+  return [ lowerize(initial) ].concat(parts.slice(1).map(capitalize)).join("");
+}
 
 /** extracts the function body from its string representation, as returend by
  * toString()
@@ -125,11 +197,11 @@ var noColor = '\x1b[0m';
 /** formats a source code line to display the error location */
 function formatErrorLine(src, line, col) {
   var text = src.split("\n")[line - 1];
-  return blue + text.substring(0, col) + cyan + "<!"+bold+blue+text.substring(col)+cyan+">" + noColor;
-}
+  return chalk.blue(text.substring(0, col)) + chalk.cyan("<!")+chalk.bold.blue(text.substring(col))+chalk.cyan(">");
+ }
 
 function logMinifyError(testPath, src, err) {
-    console.log("Failed to minify " + underline + testPath.join(" / ") + noColor);
+    console.log("Failed to minify " + chalk.underline(testPath.join(" / ")));
     console.log(formatErrorLine(src, err.line, err.col));
     console.log("  ", err.message);
 }
@@ -184,13 +256,23 @@ function matchStep(regex, pathItem) {
   return regex == null || regex === "*" || regex.test(pathItem || "");
 }
 
-function matchFilter(pathFilter, testPath) {
-  for (var i = 0; i < pathFilter.length; ++i) {
-    if (!matchStep(pathFilter[i], testPath[i])) {
-      return false;
+/** returns true if testPath matches the pathFilter
+ * If pathFilter is an array of RegExp, tries to match each path step to 
+ *   the corresponding filter
+ * Otherwise, tries to match each step to the RegExp and returns true if one of them matches
+ */
+function matchFilter(pathFilter /*RegExp|Regexp[] */, testPath /*:string[]*/)/*:boolean*/ {
+  if (_.isArray(pathFilter)) {
+    for (var i = 0; i < pathFilter.length; ++i) {
+      if (!matchStep(pathFilter[i], testPath[i])) {
+        return false;
+      }
     }
+    return true;
+  } else {
+    // a single RegExp : accept if any ot the steps satisfies the RegEx
+    return _.any(testPath, pathFilter.test.bind(pathFilter));
   }
-  return true;
 }
 
 /** returns true if testPath matches at least one of the supplied filters
@@ -222,31 +304,57 @@ GenerationReport.prototype.addMinifyError = function addMinifyError(testPath, fu
 /** returns true if 
  * - options include the testPath
  * - AND options do not exclude the testPath
+ * @param {object} options
+ * @param {array} options.includes
+ * @param {array} options.excludes
  */
 function accept(options, testPath) {
-  var isIncluded = matchAny(options.include, testPath);
-  var isExcluded = matchAny(options.exclude, testPath);
-  var shouldExclude = (options.exclude != null && matchAny(options.exclude, testPath));
-  return (options.include == null || matchAny(options.include, testPath))
-      && (options.exclude == null || !matchAny(options.exclude, testPath));
+  // console.log(chalk.cyan(testPath), options.includes, options.excludes);
+  var isIncluded = options.includes == null || options.includes.length === 0 || matchAny(options.includes, testPath);
+  var isExcluded = options.excludes != null && options.excludes.length !== 0 && matchAny(options.excludes, testPath);
+  // var shouldExclude = (options.excludes != null && matchAny(options.excludes, testPath));
+  var res = isIncluded
+      && !isExcluded;
+  if (options.verbose && !res) {
+    console.log(isIncluded 
+          ? chalk.yellow(testPath.join("/"), " excluded")
+          : chalk.magenta(testPath.join("/"), " not included"));
+  }
+  // console.log(chalk.cyan(testPath)," : ",res, " {", isIncluded,',', isExcluded, '}');
+  return res;
 }
 
-/** generates a test property and its function */
+/** generates a test property and its function ,
+ * @param {object} options
+ * @param {boolean} options.minify
+ * @param {string} test - the test source code
+ * @param {string[]} testPath - the path to this test in the source object
+ * @param {object} ioReport -
+ * @param {string} tab - 
+*/
 function genTestString(options,test, testPath, ioReport, tab) {
   options = options || {};
   var body = adaptToRuntime(extractFunctionBody(test.exec.toString()));
   var isAsync = isAsyncTest(body);
-  var bodyMin = options.noMinify ? body : tryMinifyBody(testPath, body, ioReport.addMinifyError.bind(ioReport));
+  var bodyMin = options.minify ? tryMinifyBody(testPath, body, ioReport.addMinifyError.bind(ioReport)) : body;
   var res = "";
   //str += "// " + body.length + " chars, "+bodyMin.length+ " minified\n"
-  res += "\n" + tab +"\""+jsEscape(last(testPath))+"\":";
+  //res += "\n" + tab +"\""+jsEscape(last(testPath))+"\":";
+  res += "\n" + tab +makeIdentifier(last(testPath))+":";
   res += (isAsync ? "a" :"f") +"(\"";
   res += jsEscape(bodyMin);
   res += "\")";
   return res;
 }
 
-
+/** generates the source code for a group of tests
+ * @param {array} groupPath - the path to this group in the tree
+ * @param {object} tests - the source test definitions (as provided by data-esX.js)
+ * @param {object} options
+ * @param {boolean} options.minify
+ * @param {object} ioReport - the generation report, mutable
+ * @param {string} tab - the tabulation for this group
+ * */ 
 function genTestGroup(groupPath, tests, options, ioReport, tab) {
   if (tests == null) return "";
   var str = "";
@@ -259,19 +367,20 @@ function genTestGroup(groupPath, tests, options, ioReport, tab) {
         test.subtests.forEach( function (sub, subIdx) {
           var testPath = groupPath.concat([test.name, sub.name]);
           if (accept(options, testPath)) {
+            ioReport.included.push(testPath.join("/"));
             //str += "// " + body.length + " chars, "+bodyMin.length+ " minified\n"
             if (subCount != 0) subStr += ","
             subStr += genTestString(options,sub, testPath, ioReport, testTab + "  ");
             subCount++;
           } else {
             ioReport.excluded.push(testPath.join("/"));
-            console.log("excluded " + test.name + " / " + sub.name);
           }
         }); // foreach
         if (subStr.length != 0) {
           // at least one subtest, we have to add this test
           if (testCount) str+= ","
           str += "\n" + testTab + "\""+jsEscape(test.name)+"\": { // test+";
+          //str += "\n" + testTab + makeIdentifier(test.name)+": { // test+";
           str += subStr;
           str += "\n"+ testTab + "}";
           testCount++;
@@ -279,14 +388,17 @@ function genTestGroup(groupPath, tests, options, ioReport, tab) {
       } else {  // it'a single test
           var testPath = groupPath.concat([test.name]);
           if (accept(options, testPath)) {
+            ioReport.included.push(testPath.join("/"));
             if (testCount) str+= ",";
             str += genTestString(options, test, testPath, ioReport, tab);
             testCount++;
+          } else {
+            ioReport.excluded.push(testPath.join("/"));
           }
       }
   }); // foreach
   if (str.length != 0) {
-    str = "\n" + tab + '"' + jsEscape(last(groupPath)) + "\": {\n" + str +"\n"+ tab + "}";
+    str = "\n" + tab + makeIdentifier(last(groupPath)) + ": {\n" + str +"\n"+ tab + "}";
   }
   return str;
 }
@@ -308,7 +420,7 @@ function genByCategory(groupPath, tests, options, ioReport, tab) {
     });
     if (str.length != 0) {
       str+= "// category " + groupPath + "\n";
-      str = "\n" + tab + '"' + jsEscape(last(groupPath)) + "\": { // group\n" + str;
+      str = "\n" + tab + makeIdentifier(last(groupPath)) + ": { // group\n" + str;
       str +="\n" + tab + "}";
     }
     return str;
@@ -319,8 +431,9 @@ function genByCategory(groupPath, tests, options, ioReport, tab) {
 }
 
 /** @param {object} options
- * @param {array} options.include
- * @param {array} options.exclude
+ * @param {array} options.includes
+ * @param {array} options.excludes
+ * @param {boolean} options.minify - if true, will try to minify the test code
  */
 function generateTests(filename, options) {
   var report = new GenerationReport();
@@ -330,7 +443,7 @@ function generateTests(filename, options) {
     str += "// ES6 compatibility checks\n";
     str += "// -------------------------\n";
     str += "var unableMsg = '"+ unableMsg + "';\n";
-    str += "function wrapStrict(f) { return function() { var v = f(); return v === true ? 'strict' : v; } }";
+    str += "function wrapStrict(f) { return function() { var v = f(); return v === true ? 'strict' : v; } }\n";
     str += "function f(b){try{return new Function('global',b)} catch(e){" 
       + "try { return wrapStrict(new Function('global','\"use strict\";'+b)); } catch (ee) { return function(){return ee;}}}}\n";
     str += "function a(b){return function() { return new Error(unableMsg)}}\n"
@@ -342,7 +455,10 @@ function generateTests(filename, options) {
     str+="\n};\n";
     fs.writeFileSync(filename,str);
   } catch (e) {
-    console.error("Unable to generate '" + filename +"' (" + e +")")
+    console.error("Unable to generate '" + filename +"' (" + e +")");
+    if (options.verbose) {
+      console.log(e.stackTrace);
+    }
   } finally {
   }
   return report;
@@ -406,6 +522,7 @@ function loadAndRunAllAsync(file, cb) {
 
 function runRecursive(tests, depth) {
   depth = depth || 0;
+  
   for (name in tests) {
     var test = tests[name];
     if (typeof test === "function") {
@@ -438,54 +555,253 @@ function loadAndRunAll(file) {
   }
 }
 
-var testGroups = {
-  es5: [/es5/],
-  es6: [/es6/],
-  es7: [/es7/],
-  // es6 categories
-  es6_optimisation: [/es6/,/optimisation/],
-  es6_syntax: [/es6/,/syntax/],
-  es6_bindings: [/es6/,/bindings/],
-  es6_functions: [/es6/,/functions/],
-  es6_builtIns: [/es6/,/built-ins/],
-  es6_builtInExtensions: [/es6/,/built-in extensions/],
-  es6_subclassing: [/es6/,/subclassing/],
-  es6_misc: [/es6/,/misc/],
-  es6_annexB: [/es6/,/annexB/],
-  // some es6 features
-  properTailCalls : [/es6/,null,/proper tail calls/],
-  defaultFunctionParameters: [/es6/,null,/default function parameters/],
-  restParameters: [/es6/,null,/rest parameters/],
-  spreadOperator: [/es6/,null,/spread (...) operator/],
-  objectLiteraleExtensions: [/es6/,null,/object literal extensions/],
-  forOfLoops: [/es6/,null,/for\.\.of loops/],
-  octalAndBinaryLiterals:[/es6/,null,/octal and binary literals/],
-  templateStrings:[/es6/,null,/template strings/],
-  regExpYandUflags:[/es6/,null,/RegExp "y" and "u" flags/],
-  destructuring:[/es6/,null,/destructuring/],
-  unicodeCodePointEscapes:[/es6/,null,/Unicode code point escapes/],
-  const:[/es6/,null,/const/],
-  let:[/es6/,null,/let/],
-  blockLevelFunctionDeclaration:[/es6/,null,/block-level function declaration/],
-  arrowFunctions:[/es6/,null,/arrow functions/],
-  class:[/es6/,null,/class/],
-  super:[/es6/,null,/super/],
-  generators:[/es6/,null,/generators/],
-  typedArrays : [/es6/,null,/typed arrays/],
-  map:[/es6/,null,/Map/],
-  set:[/es6/,null,/Set/],
+function runSingleTest(test, path) {
+  if (typeof test !== "function") return test;
+  try {
+    return test();
+  } catch (e) { return e; }
 }
 
-var f = new Function("return\"function\"==typeof Object.create");
+// from @megawac here http://stackoverflow.com/questions/25333918/js-deep-map-function
+function runAllAndReport(obj, path) {
+  if (path == null) path = [];
+  if (typeof obj === "function") {
+    return runSingleTest(obj, path);
+  } else {
+    var  res = {__path: path };
+    for (var p in obj) {
+      res[p] = runAllAndReport(obj[p], res.__path.concat(p));
+    }
+    return res;
+  }
+}
 
-//writeChecksJs({include:[testGroups.es5]}, "./compatES5.js");
-//loadAndRunAll("./compatES5.js");
+/** returns true if running node */
+function inNodeJs()/*:boolean*/ {
+  try {
+    return Object.prototype.toString.call(process) === '[object process]' 
+  } catch(e) { return false; }
+}
 
-writeChecksJs({include:[testGroups.es6], noMinify:true}, "./compatES6.js");
-loadAndRunAll("./compatES6.js");
+/** returns an object with information about the runtime environment 
+ * @see https://nodejs.org/docs/  
+*/
+function envInfo() {
+  var res = {}
+  if (inNodeJs()) {
+    var os = require("os");
+    var process = require("process");
+    res.node = {
+      os: { type: os.type() // in v0.4.4
+            , release: os.release() // in v0.4.4
+       }
+      , version: process.version
+      , arch: process.arch
+      , platform: process.platform
+      , v8 : process.versions.v8
+      }
+  }
+  if (typeof navigator !== "undefined") {
+    res.navigator = {
+      appName: navigator.appName
+      , appVersion : navigator.appVersion
+      , platform : navigator.platform
+      , product : navigator.product
+      , userAgent : navigator.userAgent
+    }
+  }
+  return res;
+}
 
-//writeChecksJs({include:[testGroups.es7]}, "./compatES7.js");
-//loadAndRunAll("./compatES7.js");
+/** loads, runs the tests and generates a report of all tests in a file 
+ * 
+ * Returns an object with :
+ * - results : a tree of objects holding the results of individual tests
+ * - env : information about the runtime environment
+ * - tests: the tests which were provided
+*/
+function runAllFromFileAndReport(file) {
+  try {
+    var tests = require(file);
+    var results= runAllAndReport(tests);
+    return {env:envInfo(), results:results, tests:tests };
+  } catch (e) {
+    console.log("unable to load file " + file);
+    console.log(e);
+    console.log(e.stack);
+  }
+}
 
-//writeChecksJs({include:[testGroups.es6_bindings],noMinify:true}, "./compatEs6Bindings.js");
-//loadAndRunAll("./compatEs6Bindings.js");
+function isSuccess(testResult) {
+  return !(typeof testResult === "object") && testResult == true;
+}
+
+function shouldIgnore(key) {
+  return typeof key !== "string" || key.startsWith("__");
+}
+
+/** computes the test summary statistics for a test report */
+function summary(report) {
+  var res = { __count:0, __success:0};
+  _.forIn(report, function (val, key) {
+    if (shouldIgnore(key)) return;
+    if (_.isObject(val) && !(val instanceof Error)) {
+      // we have a set of subtests
+      var s = summary(val);
+      res.__count += s.__count;
+      res.__success += s.__success;
+    } else {
+      // this is a final test
+       res.__count++;
+      if (isSuccess(val))  res.__success++;
+    }
+  });
+  //report.__summary = res;
+  return res;
+}
+
+function displayTest(options,result, path, tests) {
+  if (options.summary) return;
+  if (options.fail && result == true) return;
+  var unableToRun = (result instanceof Error) && result.message == unableMsg;
+  var strictOnly = (result === "strict");
+  var color = strictOnly ? chalk.cyan : (unableToRun ? chalk.blue : (result == true ? chalk.green : chalk.red));
+  var check = (result == true ? '\u2714' : '\u2718')
+  console.log(color(check, "\t", ind(options.indent ? path.length : 0), last(path)));
+  if (options.errors && (result instanceof Error)) {
+    console.log("\t\t", clipString(70,result))
+  }
+  if (options.src && tests) {
+    var test = _.get(tests, path);
+    console.log("------------------------");
+    console.log(indentCode(4, test.toString()));
+    //console.log(highlight(test.toString(), {
+    //  // optional options
+    //  language: 'javascript', // will auto-detect if omitted
+    //  theme: 'default' // a highlight.js theme
+    // }));
+    console.log("------------------------");
+  }
+}
+
+function displayReportResults(options, testResults, path, tests) {
+  //console.log(JSON.stringify(report,null," "));
+  //console.log(report);
+  _.forIn(testResults, function(test, name){ 
+    // ignore private fields
+    if (shouldIgnore(name)) return;
+    var testPath = path.concat(name);
+    if (typeof test !== "object" || test instanceof Error) {
+      // it is an elmentary test
+      if (!options.fails || test != true)
+        displayTest(options, test, testPath, tests);
+    } else {
+      var sum = summary(test);
+      var full = sum.__count === sum.__success;
+      var none = 0 === sum.__success;
+      var color = (full ? chalk.green : (none ? chalk.red : chalk.yellow));
+      if (options.fail && full) return;
+      console.log("\t",ind(options.indent ? path.length : 0), name,' ', color(sum.__success,"/",sum.__count));
+      displayReportResults(options, test, testPath, tests);
+    }
+  }); 
+};
+
+function displayReport(options, report) {
+  // display excluded tests
+  if (report.excluded && report.excluded.length !== 0) {
+    console.log(report.excluded.length," tests have been excluded");
+    if (options.verbose) {
+      console.log("\tThe following tests have been excluded")
+      _.each(report.excluded, function(testPath) {
+        console.log("\t* ",testPath);
+      });
+    }
+  }
+  // display results
+  displayReportResults(options, report.results, [], report.tests);
+}
+
+function computeAndReport(options, file) {
+  // console.log(options);
+  var report = runAllFromFileAndReport(file);
+  //console.log(JSON.stringify(report));
+  displayReport(options, report);
+}
+
+function go(options,file) { 
+  //loadAndRunAll(file);
+  computeAndReport(options,file);
+}
+
+function arr(x) { return x != null ? (_.isArray(x) ? x : [ x ]) : [] }
+function unarr(x) { return x.length === 0 ? null : x }
+
+function strToFilter(str) {
+  try {
+    if (str == null) return str;
+    var res = str.toString().split('/').map( function (x) { return (x != "" && x != "*") ? new RegExp(makeIdentifier(x)) : null; } )
+    return res.length === 1 ? res[0] : res;
+  } catch (e) {
+    console.error(chalk.red("Invalid filter : "),str);
+    process.exit(-1);
+  }
+}
+
+var testGroups = _.transform({
+  es5: 'es5',
+  es6: 'es6',
+  es7: 'es7',
+  // es6 categories
+  es6_optimisation: 'es6/optimisation',
+  es6_syntax: 'es6/syntax',
+  es6_bindings: 'es6/bindings',
+  es6_functions: 'es6/functions',
+  es6_builtIns: 'es6/builtIns',
+  es6_builtInExtensions: 'es6/builtInExtensions',
+  es6_subclassing: 'es6/subclassing',
+  es6_misc: 'es6/misc',
+  es6_annexB: 'es6/annex b',
+  // some es6 features
+  properTailCalls : 'es6//properTailCalls',
+  defaultFunctionParameters: 'es6//default function parameters',
+  restParameters: 'es6//rest parameters',
+  spreadOperator: 'es6//spread (...) operator',
+  objectLiteraleExtensions: 'es6//object literal extensions',
+  forOfLoops: 'es6//for\.\.of loops',
+  octalAndBinaryLiterals:'es6//octal and binary literals',
+  templateStrings:'es6//template strings',
+  regExpYandUflags:'es6//RegExp "y" and "u" flags',
+  destructuring:'es6//destructuring',
+  unicodeCodePointEscapes:'es6//Unicode code point escapes',
+  const:'es6//const',
+  let:'es6//let',
+  blockLevelFunctionDeclaration:'es6//block-level function declaration',
+  arrowFunctions:'es6//arrow functions',
+  class:'es6//class',
+  super:'es6//super',
+  generators:'es6//generators',
+  typedArrays : 'es6//typed arrays',
+  map:'es6//Map',
+  set:'es6//Set',
+  noAssignmentsAllowedInForInHead:'es6///noAssignmentsAllowedInForInHead',
+  miscellaneous:'es6//miscellaneous'
+}, function (acc, val, key) { acc[key] = strToFilter(val); });
+
+argv.includes = unarr(arr(argv._).map(strToFilter));
+argv.excludes = unarr(arr(argv.x).map(strToFilter));
+if (argv.verbose) {
+  console.log("Will include following filters:\n", argv.includes);
+  console.log("Will exclude following filters:\n", argv.excludes);
+}
+// writeChecksJs({include:[testGroups.es5]}, "./out/compatES5.js");
+// go("./out/compatES5.js");
+
+//writeChecksJs({include:[testGroups.es6], noMinify:true}, "./out/compatES6.js");
+//go("./out/compatES6.js");
+
+//writeChecksJs({include:[testGroups.es7]}, "./out/compatES7.js");
+//go("./out/compatES7.js");
+
+writeChecksJs(argv, argv.file);
+go(argv, argv.file);
