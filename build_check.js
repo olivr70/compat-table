@@ -6,9 +6,13 @@ var argv = require("yargs")
       })
     .help("h")
     .alias("h","help")
-    .default({ summary: false, fail: false
-        , errors:false, indent:false, verbose:false, src: false })
-    .boolean(["summary","fail","errors", "indent", "verbose", "code"])
+    .default({ generate:true, run:true, summary: false, fail: false
+        , errors:false, indent:false, verbose:false, src: false, sync:true, async:true })
+    .boolean(["generate","run","summary","fail","errors", "indent", "verbose", "code"])
+    .alias("g","generate")
+    .describe("generate", "if true, will generate the test file. Use --no-generate to use run an existing file")
+    .alias("r","run")
+    .describe("run", "if true, will run the test file and display the results to the console. Use --no-run for generation only")
     .alias("s","summary")
     .describe("summary", "if true, only summary lines for multiple tests are displayed")
     .alias("e","errors")
@@ -19,6 +23,10 @@ var argv = require("yargs")
     .describe("verbose", "display detailed information")
     .boolean("src")
     .describe("src", "display source code of tests")
+    .boolean("sync")
+    .describe("sync", "run synchronous tests")
+    .boolean("async")
+    .describe("async", "run asynchronous tests")
     .describe("f", "target file")
     .alias("f", "file")
     .default("f", "./escheck.js") 
@@ -43,10 +51,13 @@ var highlight = require('console-highlight');
 
 var _ = require('lodash');
 
+var errAsyncTestNotCompleted = new Error("Asynchronous test has not completed");
+
+var dataInternal = require("./data-internal");
 var dataES5 = require("./data-es5");
 var dataES6 = require("./data-es6");
 var dataES7 = require("./data-es7");
-var tests = {es5: dataES5.tests, es6 : dataES6.tests, es7: dataES7.tests };
+var tests = {internal: dataInternal.tests, es5: dataES5.tests, es6 : dataES6.tests, es7: dataES7.tests };
 
 // ------------------- Utilities --------------------
 
@@ -127,6 +138,69 @@ function __createIterableObject(arr, methods) {
 global.__createIterableObject = __createIterableObject;
 
 
+function makeTestPassedCallback(path, ioReport) {
+  return function (res) {
+    ioReport.asyncPending--;
+    _.set(ioReport.results, path, res || true);
+  }
+}
+global.makeTestPassedCallback = makeTestPassedCallback;
+
+
+function runTestAsync(testPath, test, ioReport) {
+    if (typeof test === "function") {
+      // it's a final test. Let's run it
+      if (isAsyncTest(test)) {
+        ioReport.asyncPending++;
+        _.set(ioReport.results, testPath, errAsyncTestNotCompleted);
+      }
+      try {
+        _.set(ioReport.results, testPath, test(global, makeTestPassedCallback(testPath, ioReport)));
+      } catch (e) {
+        _.set(ioReport.results, testPath, e);
+      }
+    } else {
+      runGroupAsync(testPath, test, ioReport);
+    }
+}
+
+function runGroupAsync(path, group, ioReport) {
+  for (var p in group) {
+    if (!shouldIgnore(p)) {
+      runTestAsync(path.concat(p), group[p], ioReport);
+    }
+  }
+}
+
+/** runs all the test in async mode and calls back with a report */
+function runAllAsync(tests, cb) {
+  try {
+    var report = {env:envInfo(), results: {}, asyncPending:0, tests:tests };
+    
+    runGroupAsync([], tests, report);
+    
+    // all tests have been run. We have to wait for completions
+    var loopCount = 10;
+    var checkFinish = function () {
+      // launch next check if pending calls
+      if (report.asyncPending > 0) {
+        if (--loopCount) {
+           console.log("Waiting for completion : ", loopCount, " ", report.asyncPending);
+           setTimeout(checkFinish, 100);
+           return;
+        }
+        else { cb(new Error("" + report.asyncPending + " asynchronous tests have not completed")); } 
+      } else {
+        cb(null, report);
+      }
+    }
+    setTimeout(checkFinish, 100);
+  } catch (e) {
+    setTimeout(function() { cb(e, null),1});
+  }
+}
+
+
 
 // ------------------------ The builder itself ---------
 
@@ -171,7 +245,7 @@ function adaptToRuntime(body) {
 }
 
 function isAsyncTest(body) {
-  return /asyncTestPassed\(\)/.test(body);
+  return /asyncTest(Passed|Failed)\(\)/.test(body);
 }
 
 function wrapAsyncTest(body) {
@@ -179,6 +253,7 @@ function wrapAsyncTest(body) {
   var str = "var res={}";
   str += "var timer = setTimeout(function() { if (res.status == undefined) { res.status = false} }, 1000);"
   str += "var asyncTestPassed = function () { if (res.status == undefined) { clearTimeout(timer); res.status = true} });"
+  str += "var asyncTestFailed = function (err) { if (res.status == undefined) { clearTimeout(timer); res.status = err || new Error('Asynchronous test failed')} });"
   str += "(function() { " + body + "})()";
   str += "return result;"
 }
@@ -335,16 +410,18 @@ function accept(options, testPath) {
 function genTestString(options,test, testPath, ioReport, tab) {
   options = options || {};
   var body = adaptToRuntime(extractFunctionBody(test.exec.toString()));
-  var isAsync = isAsyncTest(body);
-  var bodyMin = options.minify ? tryMinifyBody(testPath, body, ioReport.addMinifyError.bind(ioReport)) : body;
+  var isAsync = isAsyncTest(body);    
   var res = "";
-  //str += "// " + body.length + " chars, "+bodyMin.length+ " minified\n"
-  //res += "\n" + tab +"\""+jsEscape(last(testPath))+"\":";
-  res += "\n" + tab +makeIdentifier(last(testPath))+":";
-  res += (isAsync ? "a" :"f") +"(\"";
-  res += jsEscape(bodyMin);
-  res += "\")";
-  return res;
+  if ((isAsync && options.async) || (!isAsync && options.sync)) {
+    var bodyMin = options.minify ? tryMinifyBody(testPath, body, ioReport.addMinifyError.bind(ioReport)) : body;
+    //str += "// " + body.length + " chars, "+bodyMin.length+ " minified\n"
+    //res += "\n" + tab +"\""+jsEscape(last(testPath))+"\":";
+    res += "\n" + tab +makeIdentifier(last(testPath))+":";
+    res += (isAsync ? "a" :"f") +"(\"";
+    res += jsEscape(bodyMin);
+    res += "\")";
+    return res;
+  }
 }
 
 /** generates the source code for a group of tests
@@ -446,9 +523,12 @@ function generateTests(filename, options) {
     str += "function wrapStrict(f) { return function() { var v = f(); return v === true ? 'strict' : v; } }\n";
     str += "function f(b){try{return new Function('global',b)} catch(e){" 
       + "try { return wrapStrict(new Function('global','\"use strict\";'+b)); } catch (ee) { return function(){return ee;}}}}\n";
-    str += "function a(b){return function() { return new Error(unableMsg)}}\n"
+    // str += "function a(b){return function() { return new Error(unableMsg)}}\n"
+    str += "function a(b){ try { return new Function('global', 'asyncTestPassed', b); } catch (e) { return e; } }\n";
     str += "module.exports = {";
-    var groups = [genTestGroup(['es5'], tests.es5, options, report, "  "),
+    var groups = [
+              genTestGroup(['internal'], tests.internal, options, report, "  "),
+              genTestGroup(['es5'], tests.es5, options, report, "  "),
               genByCategory(['es6'], tests.es6, options, report, "  "),
               genByCategory(['es7'], tests.es7, options, report, "  ")];
     str += joinNotEmpty(groups, ",\n");
@@ -473,6 +553,7 @@ function writeChecksJs(options, filename) {
   if (!filename) filename = "./compatCheck.js"; 
   var res = generateTests(filename, options);
   dumpGenerationResult(res);
+  console.log("File ",filename," has been generated");
 }
 
 function runAllTests() {
@@ -729,9 +810,46 @@ function computeAndReport(options, file) {
   displayReport(options, report);
 }
 
+/** loads, runs the tests and generates a report of all tests in a file 
+ * 
+ * Returns an object with :
+ * - results : a tree of objects holding the results of individual tests
+ * - env : information about the runtime environment
+ * - tests: the tests which were provided
+*/
+function runAllFromFileAsync(file, cb) {
+  try {
+    var tests = require(file);
+    runAllAsync(tests, cb);
+  } catch (e) {
+    console.log("unable to load file " + file);
+    console.log(e);
+    console.log(e.stack);
+    cb(e);
+  }
+}
+
+function computeAndReportAsync(options, file) {
+  console.log("-------------------------");
+  console.log("Running tests from file '",file,"'");
+  console.log();
+  runAllFromFileAsync(file, function (err, report) {
+    if (err) {
+      console.error("An error occured while asychronoulsy running the tests : ", err);
+    } else {
+      displayReport(options, report);
+    }
+  })
+}
+
 function go(options,file) { 
   //loadAndRunAll(file);
-  computeAndReport(options,file);
+  computeAndReportAsync(options,file);
+}
+
+function writeAndGo(options, file) {
+  if (options.generate) writeChecksJs(options, file);
+  if (options.run) go(options, file);
 }
 
 function arr(x) { return x != null ? (_.isArray(x) ? x : [ x ]) : [] }
@@ -794,14 +912,10 @@ if (argv.verbose) {
   console.log("Will include following filters:\n", argv.includes);
   console.log("Will exclude following filters:\n", argv.excludes);
 }
-// writeChecksJs({include:[testGroups.es5]}, "./out/compatES5.js");
-// go("./out/compatES5.js");
+// writeAndGo({include:[testGroups.es5]}, "./out/compatES5.js");
 
-//writeChecksJs({include:[testGroups.es6], noMinify:true}, "./out/compatES6.js");
-//go("./out/compatES6.js");
+//writeAndGo({include:[testGroups.es6], noMinify:true}, "./out/compatES6.js");
 
-//writeChecksJs({include:[testGroups.es7]}, "./out/compatES7.js");
-//go("./out/compatES7.js");
+//writeAndGo({include:[testGroups.es7]}, "./out/compatES7.js");
 
-writeChecksJs(argv, argv.file);
-go(argv, argv.file);
+writeAndGo(argv, argv.file);
