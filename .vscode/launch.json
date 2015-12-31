@@ -7,7 +7,7 @@
 			"request": "launch",
 			"program": "build_check.js",
 			"stopOnEntry": false,
-			"args": [ "internal/*" ],
+			"args": [ "internal/*", "--compiler", "babel", "--no-run" ],
 			"cwd": ".",
 			"runtimeExecutable": null,
 			"runtimeArgs": [

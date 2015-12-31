@@ -35,6 +35,8 @@ var argv = require("yargs")
     .describe("minify", "if set, will try to minify tests")
     .alias("x", "exclude")
     .describe("x", "test path pattern to exclude, as a RegExp, ")
+    .choices("compiler", ["babel"])
+    .describe("compiler", "if set, each test source will be compiled separetely before generation")
     .argv;
     
     
@@ -46,8 +48,10 @@ var reportOptions = {
     
 var fs         = require('fs');
 var chalk      = require('chalk');
-var UglifyJS = require("uglify-js");
+var UglifyJS = require('uglify-js');
 var highlight = require('console-highlight');
+
+var babel = require('babel-core');
 
 var _ = require('lodash');
 
@@ -213,10 +217,11 @@ function lowerize(s/*:string*/) {
   return s.charAt(0).toLowerCase() + s.substring(1);
 }
 
-/** transforms any string to a valid identifier
+/** transforms any string to a valid Javascript identifier
  */
 function makeIdentifier(str) {
   var parts = str.split(/\W+/).filter(Boolean);
+    // filter(Boolean) removes empty parts
   var initial = parts[0];
   if (/[0-9]/.test(initial.charAt(0))) initial = "_" + initial;
   var res = [ initial.toLowerCase() ];
@@ -225,17 +230,21 @@ function makeIdentifier(str) {
 
 /** extracts the function body from its string representation, as returend by
  * toString()
+ * @return {string|undefined} - if extraction fails, returns undefined
  */
 function extractFunctionBody(func) {
   var commentedBody = /[^]*\/\*([^]*)\*\/\}$/.exec(func);
   if (commentedBody) {
     return commentedBody[1].trim();
   } else {
-    var explicitBody = /^\s*function\s*\(([^\)]*)\)\s*\{([^]*)\}\s*$/.exec(func);
+    var explicitBody = /^\s*(?:["']use strict["'];)?\s*function\s*([_\w]\w*)?\(([^\)]*)\)\s*\{([^]*)\}\s*$/.exec(func);
     if (explicitBody) {
-      return explicitBody[2].trim();
+      return explicitBody[3].trim();
     }
   }
+  console.log("Unable to extract function body from : ");
+  console.log(func);
+  return undefined;
 }
 
 /** changed the test source code for our runtime environment */
@@ -325,6 +334,23 @@ function runTest(func) {
   }
 }
 
+function selectCompiler(name) {
+  var compileFunc = undefined;
+  switch(name) {
+    case "babel" : 
+      compileFunc = function (src) { return babel.transform(src, {presets: ['es2015']} ).code; };
+      break;
+    default: return undefined;
+  }
+  return function (src) {
+    try { 
+      return compileFunc(src);
+    } catch (e) {
+      return new Error("Unable to compile");
+    }
+  }
+}
+
 /** tests if regex can match a part of pathItem
  * Always returns true if regex is null, undefined or "*" */
 function matchStep(regex, pathItem) {
@@ -400,19 +426,33 @@ function accept(options, testPath) {
 }
 
 /** generates a test property and its function ,
- * @param {object} options
- * @param {boolean} options.minify
+ * @param {object|null} options
+ * @param {boolean} options.minify- if true, source is minified
+ * @param {boolean} options.sync - if true, synchronous tests are generated
+ * @param {boolean} options.async - if true, asynchronous tests are generated
  * @param {string} test - the test source code
  * @param {string[]} testPath - the path to this test in the source object
  * @param {object} ioReport -
- * @param {string} tab - 
+ * @param {string} tab - the indentation for this
 */
 function genTestString(options,test, testPath, ioReport, tab) {
   options = options || {};
-  var body = adaptToRuntime(extractFunctionBody(test.exec.toString()));
-  var isAsync = isAsyncTest(body);    
+  var body = extractFunctionBody(test.exec.toString());
+  var keepIt = true;
+  if (body) {
+    // test for async before compiling, because linting compilers discard the original source code
+    var isAsync = isAsyncTest(body); 
+    keepIt = (isAsync && options.async) || (!isAsync && options.sync);
+    if (options.compilerFunction) {
+      // body may contain a return statement, which can only appear in a function definition
+      body = options.compilerFunction("function z(){" + body + "} ") + "return z();";
+    }
+    body = adaptToRuntime(body);
+  } else {
+    body = 'return new Error("Unable to extract function body")';
+  }   
   var res = "";
-  if ((isAsync && options.async) || (!isAsync && options.sync)) {
+  if (keepIt) {
     var bodyMin = options.minify ? tryMinifyBody(testPath, body, ioReport.addMinifyError.bind(ioReport)) : body;
     //str += "// " + body.length + " chars, "+bodyMin.length+ " minified\n"
     //res += "\n" + tab +"\""+jsEscape(last(testPath))+"\":";
@@ -848,6 +888,9 @@ function go(options,file) {
 }
 
 function writeAndGo(options, file) {
+  if (options.compiler) {
+    options.compilerFunction = selectCompiler(options.compiler);
+  }
   if (options.generate) writeChecksJs(options, file);
   if (options.run) go(options, file);
 }
