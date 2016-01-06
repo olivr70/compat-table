@@ -1,0 +1,4 @@
+{
+  "includes": "es7",
+  "minify":false
+}

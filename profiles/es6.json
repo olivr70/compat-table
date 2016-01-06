@@ -1,0 +1,4 @@
+{
+  "includes":["es6"],
+  "minify":false
+}

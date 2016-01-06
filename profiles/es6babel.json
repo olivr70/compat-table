@@ -1,0 +1,5 @@
+{
+  "includes":["es6"],
+  "minify":false,
+  "compiler":"babel"
+}
